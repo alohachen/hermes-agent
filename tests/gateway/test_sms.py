@@ -4,7 +4,13 @@ Covers config loading, format/truncate, echo prevention,
 requirements check, and toolset verification.
 """
 
+import asyncio
+import base64
+import hashlib
+import hmac
 import os
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from unittest.mock import patch
 
 import pytest
@@ -139,6 +145,90 @@ class TestSmsEchoPrevention:
             pc = PlatformConfig(enabled=True, api_key="tok")
             adapter = SmsAdapter(pc)
             assert adapter._from_number == "+15550001111"
+
+
+# ── Webhook signature validation ───────────────────────────────────
+
+class TestSmsWebhookSignatureValidation:
+    def _make_adapter(self):
+        from gateway.platforms.sms import SmsAdapter
+
+        env = {
+            "TWILIO_ACCOUNT_SID": "ACtest",
+            "TWILIO_AUTH_TOKEN": "twilio_token",
+            "TWILIO_PHONE_NUMBER": "+15550001111",
+        }
+        with patch.dict(os.environ, env):
+            pc = PlatformConfig(enabled=True, api_key="twilio_token")
+            adapter = SmsAdapter(pc)
+            adapter.handle_message = AsyncMock()
+            return adapter
+
+    @staticmethod
+    def _signature(url: str, form: dict[str, str], token: str) -> str:
+        payload = url + "".join(f"{key}{form[key]}" for key in sorted(form))
+        return base64.b64encode(
+            hmac.new(token.encode("utf-8"), payload.encode("utf-8"), hashlib.sha1).digest()
+        ).decode("ascii")
+
+    def test_webhook_rejects_missing_signature(self):
+        adapter = self._make_adapter()
+        raw = b"From=%2B15551234567&To=%2B15550001111&Body=hello&MessageSid=SM123"
+        request = SimpleNamespace(
+            headers={},
+            url="https://example.test/webhooks/twilio",
+            read=AsyncMock(return_value=raw),
+        )
+
+        response = asyncio.run(adapter._handle_webhook(request))
+
+        assert response.status == 403
+        adapter.handle_message.assert_not_called()
+
+    def test_webhook_rejects_invalid_signature(self):
+        adapter = self._make_adapter()
+        raw = b"From=%2B15551234567&To=%2B15550001111&Body=hello&MessageSid=SM123"
+        request = SimpleNamespace(
+            headers={"X-Twilio-Signature": "invalid"},
+            url="https://example.test/webhooks/twilio",
+            read=AsyncMock(return_value=raw),
+        )
+
+        response = asyncio.run(adapter._handle_webhook(request))
+
+        assert response.status == 403
+        adapter.handle_message.assert_not_called()
+
+    def test_webhook_accepts_valid_signature(self):
+        adapter = self._make_adapter()
+        form = {
+            "From": "+15551234567",
+            "To": "+15550001111",
+            "Body": "hello",
+            "MessageSid": "SM123",
+        }
+        raw = (
+            "From=%2B15551234567&To=%2B15550001111&Body=hello&MessageSid=SM123".encode(
+                "utf-8"
+            )
+        )
+        url = "https://example.test/webhooks/twilio"
+        signature = self._signature(url, form, "twilio_token")
+        request = SimpleNamespace(
+            headers={"X-Twilio-Signature": signature},
+            url=url,
+            read=AsyncMock(return_value=raw),
+        )
+
+        async def _invoke():
+            response = await adapter._handle_webhook(request)
+            await asyncio.sleep(0)
+            return response
+
+        response = asyncio.run(_invoke())
+
+        assert response.status == 200
+        adapter.handle_message.assert_called_once()
 
 
 # ── Requirements check ─────────────────────────────────────────────

@@ -17,6 +17,8 @@ Gateway-specific env vars:
 
 import asyncio
 import base64
+import hashlib
+import hmac
 import logging
 import os
 import re
@@ -207,6 +209,34 @@ class SmsAdapter(BasePlatformAdapter):
     # Twilio webhook handler
     # ------------------------------------------------------------------
 
+    def _validate_twilio_signature(
+        self,
+        request: "aiohttp.web.Request",
+        form: Dict[str, list[str]],
+    ) -> bool:
+        """Validate Twilio webhook signature using X-Twilio-Signature."""
+        signature = request.headers.get("X-Twilio-Signature", "").strip()
+        if not signature:
+            return False
+
+        # Twilio signs: full URL + each form key/value (sorted by key)
+        signed_data = str(request.url)
+        for key in sorted(form.keys()):
+            values = form.get(key, [])
+            if not isinstance(values, list):
+                values = [values]
+            for value in values:
+                signed_data += f"{key}{value}"
+
+        expected = base64.b64encode(
+            hmac.new(
+                self._auth_token.encode("utf-8"),
+                signed_data.encode("utf-8"),
+                hashlib.sha1,
+            ).digest()
+        ).decode("ascii")
+        return hmac.compare_digest(expected, signature)
+
     async def _handle_webhook(self, request) -> "aiohttp.web.Response":
         from aiohttp import web
 
@@ -220,6 +250,14 @@ class SmsAdapter(BasePlatformAdapter):
                 text='<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
                 content_type="application/xml",
                 status=400,
+            )
+
+        if not self._validate_twilio_signature(request, form):
+            logger.warning("[sms] rejected unsigned/invalid Twilio webhook request")
+            return web.Response(
+                text='<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
+                content_type="application/xml",
+                status=403,
             )
 
         # Extract fields (parse_qs returns lists)
